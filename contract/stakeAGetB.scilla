@@ -1,0 +1,927 @@
+scilla_version 0
+
+(***************************************************)
+(*               Associated library                *)
+(***************************************************)
+import IntUtils BoolUtils
+library Staking
+
+let one_msg = 
+  fun (msg : Message) => 
+  let nil_msg = Nil {Message} in
+  Cons {Message} msg nil_msg
+
+let two_msgs =
+fun (msg1 : Message) =>
+fun (msg2 : Message) =>
+  let msgs_tmp = one_msg msg2 in
+  Cons {Message} msg1 msgs_tmp
+
+let blk_leq =
+  fun (blk1 : BNum) =>
+  fun (blk2 : BNum) =>
+    let bc1 = builtin blt blk1 blk2 in 
+    let bc2 = builtin eq blk1 blk2 in 
+    orb bc1 bc2
+    
+let uint128_leq =
+  fun (blk1 : Uint128) =>
+  fun (blk2 : Uint128) =>
+    let bc1 = builtin lt blk1 blk2 in 
+    let bc2 = builtin eq blk1 blk2 in 
+    orb bc1 bc2
+    
+let uint128_to_uint256 : Uint128 -> Uint256 =
+  fun (x : Uint128) =>
+    let ox256 = builtin to_uint256 x in
+      match ox256 with
+      | None =>
+        (* this never happens, hence we throw a division by zero exception just in case *)
+        let zero = Uint256 0 in
+        builtin div zero zero
+      | Some x256 => x256
+      end
+    
+
+(* Compute "(x * y) / z" with protection against integer overflows *)
+let muldiv : Uint128 -> Uint128 -> Uint128 -> Uint128 =
+    fun (x : Uint128) =>
+    fun (y : Uint128) =>
+    fun (z : Uint128) =>
+      let x256 = uint128_to_uint256 x in
+      let y256 = uint128_to_uint256 y in
+      let z256 = uint128_to_uint256 z in
+      let x_mul_y256 = builtin mul x256 y256 in
+      let res256 = builtin div x_mul_y256 z256 in
+      let ores128 = builtin to_uint128 res256 in
+      match ores128 with
+      | None =>
+        (* this must never happen, hence we throw an integer overflow exception *)
+        let max_uint128 = Uint128 340282366920938463463374607431768211455 in
+        let fourtytwo128 = Uint128 42 in
+        builtin mul max_uint128 fourtytwo128
+      | Some res128 =>
+        res128
+      end
+
+
+(*fixed numbers for formulas*)
+let hundred = Uint128 100
+let week = Uint128 7
+let year = Uint128 365
+let zero = Uint128 0
+let intZero = Int32 0
+let two = Uint128 2
+let false = False
+let true = True
+
+let blkZero = BNum 0
+let uintOne = Uint128 1
+let uintTen = Uint128 10
+let tierCount = Uint128 10
+
+let intZero = Int32 0
+let intOne = Int32 1
+
+let rThousand = Uint128 1000
+let tenThousand = Uint128 10000
+
+let get_val =
+  fun (some_val: Option Uint128) =>
+    match some_val with
+    | Some val => val
+    | None => zero
+    end
+    
+let get_tier =
+  fun (some_val: Option Uint128) =>
+    match some_val with
+    | Some val => val
+    | None => uintOne
+    end
+    
+let get_Intval =
+  fun (some_val: Option Int32) =>
+    match some_val with
+    | Some val => val
+    | None => intZero
+    end
+
+
+let get_blkval =
+  fun (some_val: Option BNum) =>
+    match some_val with
+    | Some val => val
+    | None => blkZero
+    end
+
+
+(*Status code*)
+let intializeContract = Int32 1
+
+
+(* Error events *)
+type Error =
+| CodeIsNotSender
+| CodeInsufficientTokens
+| CodeExceedAvailable
+| CodeNotStaker
+| CodeBlockNotReach
+| CodeNoPending
+| CodeWrongToken
+| CodeContractPaused
+| CodeNotWhitelisted
+| CodeLessThanMinimumStake
+| CodeRewardBlocksNotMet
+| CodeWrongAmountStaked
+| CodeNotImplementation
+| CodeNotEpochZero
+
+let make_error =
+  fun (result : Error) =>
+    let result_code = 
+      match result with
+      | CodeIsNotSender => Int32 -1
+      | CodeInsufficientTokens     => Int32 -2
+      | CodeExceedAvailable => Int32 -3
+      | CodeNotStaker => Int32 -4
+      | CodeBlockNotReach => Int32 -5
+      | CodeNoPending => Int32 -6
+      | CodeWrongToken => Int32 -7
+      | CodeContractPaused => Int32 -8
+      | CodeNotWhitelisted => Int32 -9
+      | CodeLessThanMinimumStake => Int32 -10
+      | CodeRewardBlocksNotMet => Int32 -11
+      | CodeWrongAmountStaked => Int32 -12
+      | CodeNotImplementation => Int32 -13
+      | CodeNotEpochZero      => Int32 -14
+      end
+    in
+    { _exception : "Error"; code : result_code }
+    
+contract TokenStake
+(
+  initial_owner : ByStr20,
+  tokenAContract : ByStr20,
+  tokenBContract : ByStr20
+)
+
+(*Used for ownership change*)
+field current_owner : ByStr20 = initial_owner
+field pending_owner : Option ByStr20 = None {ByStr20}
+
+(*Change token addresses in the future*)
+field tokenA_addr : ByStr20 = tokenAContract
+field tokenB_addr : ByStr20 = tokenBContract
+
+(*Token A Staked*)
+field stakers : Map ByStr20 Uint128 = Emp ByStr20 Uint128
+field pending_tokenA : Map ByStr20 Uint128 = Emp ByStr20 Uint128
+
+field cycleCount : Map ByStr20 Int32 = Emp ByStr20 Int32
+
+field removeStaker: Map ByStr20 Uint128 = Emp ByStr20 Uint128
+field removeBlock : Map ByStr20 BNum = Emp ByStr20 BNum
+field totalStaked : Uint128 = Uint128 0
+field totalStakers : Uint128 = Uint128 0
+field minimumStake : Uint128 = Uint128 0
+
+
+(*Token B per epoch*)
+field tokenBreward : Uint128 = Uint128 0
+field tokenAbalance : Uint128 = Uint128 0
+field tokenBbalance : Uint128 = Uint128 0
+
+field pending_tokenB : Map ByStr20 Uint128 = Emp ByStr20 Uint128
+field tmp_tokenB : Uint128 = Uint128 0
+
+
+
+
+(*Unstaking related*)
+field unstakePercent : Uint128 = Uint128 50
+field remove_bnum : Uint64 = Uint64 16000
+field penalty : Uint128 = Uint128 10
+field burntAmount : Uint128 = Uint128 50
+field burnAddress : ByStr20 = initial_owner
+field penaltyRewardPerStaker : Uint128 = Uint128 0
+
+
+(*Contract Related*)
+field pauseStake : Bool = True
+field rewardBlocks : BNum = BNum 0
+field lastReward : BNum = BNum 0
+field rewardTime : Uint128 = Uint128 2500
+field autoFee : Uint128 = Uint128 1000000
+
+procedure ThrowError(err : Error)
+  e = make_error err;
+  throw e
+end
+
+procedure isOwner()
+  owner <- current_owner;
+  isOwner = builtin eq _sender owner;
+  match isOwner with
+    | False =>
+      err = CodeIsNotSender;
+      ThrowError err
+    | True =>
+  end
+end
+
+procedure isPaused()
+  isPaused <- pauseStake;
+  match isPaused with
+    | False =>
+    | True =>
+      err = CodeContractPaused;
+      ThrowError err
+  end
+end
+
+procedure minimumStake (amount: Uint128)
+  min <- minimumStake;
+  isMin = builtin lt amount min;
+  match isMin with
+    | True =>
+      err = CodeLessThanMinimumStake;
+      ThrowError err
+    | False =>
+  end
+end
+
+
+procedure addRewards(staker: Pair ByStr20 Uint128)
+  match staker with
+    | Pair key value  =>
+      (*Expand Token B to prevent underflow, *)
+
+      staking <- stakers[key];
+      totalStake <- totalStaked;
+      tokenBDistri <- tokenBreward;
+      tokenBbal <- tokenBbalance;
+      pending <- pending_tokenB[key];
+      usr_staking = get_val staking;
+      addPending = muldiv usr_staking tokenBDistri totalStake;
+      (*Check if unstaking*)
+      isUnstaking <- removeStaker[key];
+      match isUnstaking with
+        | Some unstake =>
+          unstakingPercent <- unstakePercent;
+          tmp_amount = builtin mul addPending hundred;
+          deduct_amount = builtin mul addPending unstakingPercent;
+          new_amount = builtin sub tmp_amount deduct_amount;
+          addNewAmount = builtin div new_amount hundred;
+          match pending with
+            | Some pending =>
+              newAmount = builtin add pending addNewAmount;
+              pending_tokenB[key] := newAmount;
+              newBbalance = builtin sub tokenBbal addNewAmount;
+              tokenBbalance := newBbalance
+            | None =>
+              pending_tokenB[key] := addNewAmount;
+              newBbalance = builtin sub tokenBbal addNewAmount;
+              tokenBbalance := newBbalance
+          end
+        | None =>
+          cyc <- cycleCount[key];
+          count = get_Intval cyc;
+          newCount = builtin add count intOne;
+          cycleCount[key] := newCount;
+          match pending with
+            | Some pending =>
+              newAmount = builtin add pending addPending;
+              pending_tokenB[key] := newAmount;
+              newBbalance = builtin sub tokenBbal addPending;
+              tokenBbalance := newBbalance
+            | None =>
+              pending_tokenB[key] := addPending;
+              newBbalance = builtin sub tokenBbal addPending;
+              tokenBbalance := newBbalance
+          end
+      end
+  end
+end
+
+procedure penaltyToStakers(staker: Pair ByStr20 Uint128)
+  match staker with
+    | Pair key value  =>
+      pending <- pending_tokenA[key];
+      reward <- penaltyRewardPerStaker;
+      match pending with
+        | Some pending =>
+          newAmount = builtin add pending reward;
+          pending_tokenA[key] := newAmount
+        | None =>
+          pending_tokenA[key] := reward
+      end
+  end
+end
+
+
+transition initializeContract()
+  owner <- current_owner;
+  currentValue <- rewardBlocks;
+  lastRewarded <- lastReward;
+  rewardTimeBlock <- rewardTime;
+  isOwner = builtin eq _sender owner;
+  match isOwner with
+    | True =>
+      currentBlock <- & BLOCKNUMBER;
+      newRewardBlock = builtin badd currentBlock rewardTimeBlock;
+      rewardBlocks := newRewardBlock;
+      lastReward := currentBlock;
+      msg  = {_tag : ""; _recipient : _sender; _amount : Uint128 0;
+          code : intializeContract};
+      msgs = one_msg msg;
+      send msgs
+    | False =>
+      err = CodeIsNotSender;
+      ThrowError err
+  end
+end
+
+
+
+(*Global Functions*)
+transition rewardAll()
+  isPaused;
+  currentBlk <- & BLOCKNUMBER;
+  rewardBlock <- rewardBlocks;
+  isBlockHigher = blk_leq currentBlk rewardBlock;
+  match isBlockHigher with
+    | True =>
+      (*Not enough blocks yet*)
+      err = CodeRewardBlocksNotMet;
+      ThrowError err
+    | False =>
+      initialTokenB <- tokenBbalance;
+      (*Give all users their rewards*)
+      stake <- stakers;
+      staker_list = builtin to_list stake;
+      forall staker_list addRewards;
+      
+      (*Increase block count*)
+      currentBlockCycle <- rewardBlocks;
+      rewardTimeBlock <- rewardTime;
+      newRewardBlock = builtin badd currentBlockCycle rewardTimeBlock;
+      rewardBlocks := newRewardBlock;
+      lastReward := currentBlockCycle;
+
+      newTokenBbalance <- tokenBbalance;
+      rewardsGiven = builtin sub initialTokenB newTokenBbalance;
+      event_rewardsGiven = { _eventname: "rewardsAwarded"; block: currentBlk; rewardGiven: rewardsGiven};
+      event event_rewardsGiven
+  end
+end
+
+transition giveBonus(address: ByStr20, bps: Uint128)
+  isOwner;
+  isPaused;
+  opt_stakedAmt <- stakers[address];
+  stakedAmt = get_val opt_stakedAmt;
+  balA <- tokenAbalance;
+  
+  expandAmt = builtin mul stakedAmt tenThousand;
+  increaseAmt = builtin mul stakedAmt bps;
+  expandedNew = builtin add expandAmt increaseAmt;
+  
+  newAmt = builtin div expandedNew tenThousand;
+  diff = builtin sub newAmt stakedAmt;
+  newBalanceA = builtin sub balA diff;
+  tokenAbalance := newBalanceA;
+  
+  pendA <- pending_tokenA[address];
+  match pendA with
+    | Some pendA =>
+      newPend = builtin add pendA diff;
+      pending_tokenA[address] := newPend
+    | None =>
+      pending_tokenA[address] := diff
+  end
+  
+
+end
+
+transition addStakedTokenA(amount: Uint128)
+  isPaused;
+  a_addr <- tokenA_addr;
+  msg = {_tag : "TransferFrom"; _recipient: a_addr; _amount: zero; from: _sender ; to: _this_address; amount: amount};
+  msgs = one_msg msg;
+  send msgs
+end
+
+transition withdrawPendingA()
+  pending <- pending_tokenA[_sender];
+  a_addr <- tokenA_addr;
+  match pending with
+    | Some pending =>
+      delete pending_tokenA[_sender];
+      msg = {_tag : "Transfer"; _recipient: a_addr; _amount: zero; to: _sender; amount: pending};
+      msgs = one_msg msg;
+      send msgs
+    | None =>
+      (*No pending tokens*)
+      err = CodeNoPending;
+      ThrowError err
+  end
+end
+
+transition withdrawPendingB()
+  pending <- pending_tokenB[_sender];
+  b_addr <- tokenB_addr;
+  match pending with
+    | Some pending =>
+      delete pending_tokenB[_sender];
+      msg = {_tag : "Transfer"; _recipient: b_addr; _amount: zero; to: _sender; amount: pending};
+      msgs = one_msg msg;
+      send msgs
+    | None =>
+      (*No pending tokens*)
+      err = CodeNoPending;
+      ThrowError err
+  end
+end
+
+
+transition removeStakeIfEpochZero()
+  opt_accBalance <- stakers[_sender];
+  accBalance = get_val opt_accBalance;
+  total_staked <- totalStaked;
+  currentEpochCount <- cycleCount[_sender];
+  epochValue = get_Intval currentEpochCount;
+  isZero = builtin eq epochValue intZero;
+  match isZero with
+    | True =>
+      a_addr <- tokenA_addr;
+      msg = {_tag : "Transfer"; _recipient: a_addr; _amount: Uint128 0;
+              to: _sender; amount: accBalance};
+      msgs = one_msg msg;
+      send msgs;
+      
+      delete stakers[_sender];
+      delete cycleCount[_sender];
+      
+      newStaked = builtin sub total_staked accBalance;
+      totalStaked := newStaked;
+      
+      current_stake <- totalStakers;
+      new_stakers = builtin sub current_stake uintOne;
+      totalStakers := new_stakers
+      
+    | False =>
+      err = CodeNotEpochZero;
+      ThrowError err
+  end
+end
+
+
+transition removeStake()
+  accBalance <- stakers[_sender];
+  match accBalance with
+    | Some accBalance =>
+      removeStaker[_sender] := accBalance;
+      remove_block <- remove_bnum;
+      current_block <- & BLOCKNUMBER;
+      block_required = builtin badd current_block remove_block;
+      removeBlock[_sender] := block_required
+    | None =>
+      err = CodeNotStaker;
+      ThrowError err
+  end
+end
+
+transition withdrawStake()
+  current_block <- & BLOCKNUMBER;
+  blocks_required <- removeBlock[_sender];
+  a_addr <- tokenA_addr;
+  total_staked <- totalStaked;
+  total_stakers <- totalStakers;
+  match blocks_required with
+    | None =>
+    | Some blocks_required =>
+      is_more = blk_leq blocks_required current_block;
+      match is_more with
+        | True =>
+          (*pass withdrawal*)
+          amount <- removeStaker[_sender];
+          match amount with
+            | None =>
+            | Some amount =>
+              newUnstaked = builtin sub total_staked amount;
+              totalStaked := newUnstaked;
+              newStakers = builtin sub total_stakers uintOne;
+              totalStakers := newStakers;
+              msg = {_tag : "Transfer"; _recipient: a_addr; _amount: Uint128 0;
+                      to: _sender; amount: amount};
+              msgs = one_msg msg;
+              send msgs;
+              delete stakers[_sender];
+              delete cycleCount[_sender];
+              delete removeBlock[_sender];
+              delete removeStaker[_sender]
+          end
+        | False =>
+          (*Reject as block time is not reach*)
+          err = CodeBlockNotReach;
+          ThrowError err
+      end
+  end
+end
+
+(*Fee is sent to the caller*)
+transition automaticWithdrawStake(recipient: ByStr20)
+  current_block <- & BLOCKNUMBER;
+  blocks_required <- removeBlock[recipient];
+  a_addr <- tokenA_addr;
+  fee <- autoFee;
+  total_staked <- totalStaked;
+  total_stakers <- totalStakers;
+  match blocks_required with
+    | None =>
+    | Some blocks_required =>
+      is_more = blk_leq blocks_required current_block;
+      match is_more with
+        | True =>
+          (*pass withdrawal*)
+          amount <- removeStaker[recipient];
+          match amount with
+            | None =>
+            | Some amount =>
+              newUnstaked = builtin sub total_staked amount;
+              totalStaked := newUnstaked;
+              newStakers = builtin sub total_stakers uintOne;
+              totalStakers := newStakers;
+              recipientAmount = builtin sub amount fee;
+              msg_recipient = {_tag : "Transfer"; _recipient: a_addr; _amount: Uint128 0;
+                      to: recipient; amount: recipientAmount};
+              msg_sender = {_tag : "Transfer"; _recipient: a_addr; _amount: Uint128 0;
+                      to: _sender; amount: fee};
+              msgs = two_msgs msg_recipient msg_sender;
+              send msgs;
+              delete stakers[recipient];
+              delete cycleCount[_sender];
+              delete removeBlock[recipient];
+              delete removeStaker[recipient]
+          end
+        | False =>
+          (*Reject as block time is not reach*)
+          err = CodeBlockNotReach;
+          ThrowError err
+      end
+  end
+end
+
+
+transition instantWithdrawal()
+  a_addr <- tokenA_addr;
+  penaltyRate <- penalty;
+  total_staked <- totalStaked;
+  total_stakers <- totalStakers;
+  amount <- removeStaker[_sender];
+  
+  burn <- burntAmount;
+  deadAddress <- burnAddress;
+  match amount with
+    | None =>
+    | Some amount =>
+      
+      currentBlk <- & BLOCKNUMBER;
+      remove_block <- remove_bnum;
+      opt_blockToRemove <- removeBlock[_sender];
+      blockToRemove = get_blkval opt_blockToRemove;
+      balanceBlocks = builtin bsub blockToRemove currentBlk;
+      
+      (*Change all to Uint128*)
+      (*If no balance left it would be 0 thus penalty 0*)
+      opt_uint128BalanceBlocks = builtin to_uint128 balanceBlocks;
+      uint128BalanceBlocks = get_val opt_uint128BalanceBlocks;
+      (*How many blocks is the unbonding period e.g. 25000 blocks*)
+      opt_uint128RBlock = builtin to_uint128 remove_block;
+      uint128RBlock = get_val opt_uint128RBlock;
+      
+      onePercent = builtin div amount hundred;
+      penaltyFee = builtin mul onePercent penaltyRate;
+
+      scale = builtin mul penaltyFee rThousand;
+      divScale = builtin div scale uint128RBlock;
+      rescale = builtin mul divScale uint128BalanceBlocks;
+      scaledPenalty = builtin div rescale rThousand;
+      
+      
+      (*Change away total penalty to scaledPenalty*)
+      onePercentBurn = builtin div scaledPenalty hundred;
+      burnAmount = builtin mul onePercentBurn burn;
+      
+      returnedAmount = builtin sub amount scaledPenalty;
+      returnStaker = builtin sub scaledPenalty burnAmount;
+      
+      
+      delete stakers[_sender];
+      newUnstaked = builtin sub total_staked amount;
+      totalStaked := newUnstaked;
+      newStakers = builtin sub total_stakers uintOne;
+      totalStakers := newStakers;
+      
+      perStaker = builtin div returnStaker newStakers;
+      penaltyRewardPerStaker := perStaker;
+      
+      stake <- stakers;
+      staker_list = builtin to_list stake;
+      forall staker_list penaltyToStakers;
+
+      
+      msg1 = {_tag : "Transfer"; _recipient: a_addr; _amount: Uint128 0;
+              to: _sender; amount: returnedAmount};
+      msg2 = {_tag : "Transfer"; _recipient: a_addr; _amount: Uint128 0;
+              to: deadAddress; amount: burnAmount};
+      msgs = two_msgs msg1 msg2;
+      send msgs;
+      
+      delete cycleCount[_sender];
+      delete removeBlock[_sender];
+      delete removeStaker[_sender]
+  end
+end
+
+
+
+
+(*Owner Functions*)
+transition changeTokenBrewardsPerEpoch(amount: Uint128)
+  isOwner;
+  tokenBreward := amount
+end
+
+transition changeRewardBlocks(block: Uint128)
+  isOwner;
+  rewardTime := block
+end
+
+transition changeUnstakeBlocks(block: Uint64)
+  isOwner;
+  remove_bnum := block
+end
+
+transition changeUnstakePercentReward(percent: Uint128)
+  isOwner;
+  unstakePercent := percent
+end
+
+transition changeUnstakePenalty(percent: Uint128)
+  isOwner;
+  penalty := percent
+end
+
+transition changeInstantWithdrawalBurntPercent(percent: Uint128)
+  isOwner;
+  burntAmount := percent
+end
+
+transition changeInstantWithdrawalBurnAddress(addr: ByStr20)
+  isOwner;
+  burnAddress := addr
+end
+
+transition changeMinimumStake(amount: Uint128)
+  isOwner;
+  minimumStake := amount
+end
+
+transition changeAutoWithdrawalFee(fee: Uint128)
+  isOwner;
+  autoFee := fee
+end
+
+transition pauseContract()
+  isOwner;
+  currentValue <- pauseStake;
+  match currentValue with
+    | True =>
+    | False=>
+      pauseStake := true;
+      event_paused_contract = { _eventname: "contractPaused"; paused: true};
+      event event_paused_contract
+  end
+
+end
+
+transition unpauseContract()
+  currentValue <- pauseStake;
+  isOwner;
+  match currentValue with
+    | True =>
+      pauseStake := false;
+      event_paused_contract = { _eventname: "contractPaused"; paused: false};
+      event event_paused_contract
+    | False=>
+  end
+end
+
+transition changeTokenAaddress(addr: ByStr20)
+  isOwner;
+  tokenA_addr := addr
+end
+
+transition changeTokenBaddress(addr: ByStr20)
+  isOwner;
+  tokenB_addr := addr
+end
+
+
+transition ownerWithdrawAddedTokenA (amount: Uint128)
+  owner <- current_owner;
+  isOwner = builtin eq _sender owner;
+  match isOwner with
+    | True =>
+      tokenA_bal <- tokenAbalance;
+      tokenA_add <- tokenA_addr;
+      amountNotOk = builtin lt tokenA_bal amount;
+      match amountNotOk with
+        | True =>
+          (*Exceed available*)
+          err = CodeExceedAvailable;
+          ThrowError err
+        | False =>
+          msg = {_tag : "Transfer"; _recipient: tokenA_add; _amount: zero;
+                  to: owner; amount: amount};
+          msgs = one_msg msg;
+          send msgs;
+          newAmount = builtin sub tokenA_bal amount;
+          tokenAbalance := newAmount
+      end
+    | False =>
+      err = CodeIsNotSender;
+      ThrowError err
+  end
+end
+
+transition ownerWithdrawAddedTokenB (amount: Uint128)
+  owner <- current_owner;
+  isOwner = builtin eq _sender owner;
+  match isOwner with
+    | True =>
+      tokenB_bal <- tokenBbalance;
+      tokenb_add <- tokenB_addr;
+      amountNotOk = builtin lt tokenB_bal amount;
+      match amountNotOk with
+        | True =>
+          (*Exceed available*)
+          err = CodeExceedAvailable;
+          ThrowError err
+        | False =>
+          msg = {_tag : "Transfer"; _recipient: tokenb_add; _amount: zero;
+                  to: owner; amount: amount};
+          msgs = one_msg msg;
+          send msgs;
+          newAmount = builtin sub tokenB_bal amount;
+          tokenBbalance := newAmount
+      end
+    | False =>
+      err = CodeIsNotSender;
+      ThrowError err
+  end
+end
+
+transition RequestOwnershipTransfer(new_owner : ByStr20)
+  owner <- current_owner;
+  isOwner = builtin eq _sender owner;
+  match isOwner with
+    | True =>
+      po = Some {ByStr20} new_owner;
+      pending_owner := po
+    | False =>
+      err = CodeIsNotSender;
+      ThrowError err
+  end
+end
+
+transition ConfirmOwnershipTransfer()
+  optional_po <- pending_owner;
+  match optional_po with
+  | Some optional_po =>
+      caller_is_new_owner = builtin eq _sender optional_po;
+      match caller_is_new_owner with
+      | True =>
+          (* transfer ownership *)
+          current_owner := optional_po;
+          none = None {ByStr20};
+          pending_owner := none
+      | False => (* the caller is not the new owner, do nothing*)
+        err = CodeIsNotSender;
+        ThrowError err
+      end
+  | None => (* ownership transfer is not in-progress, do nothing *)
+  end
+end
+
+
+(*transfer statements*)
+(*When Token is sent to contract address*)
+transition RecipientAcceptTransfer(
+  sender : ByStr20,
+  recipient : ByStr20,
+  amount : Uint128
+)
+  isPaused;
+  a_addr <- tokenA_addr;
+  b_addr <- tokenB_addr;
+  isTokenA = builtin eq _sender a_addr;
+  (*Additional checks if sender is owner to prevent accidental sent*)
+  owner <- current_owner;
+  isOwner = builtin eq sender owner;
+  match isOwner with
+    | True =>
+      match isTokenA with
+        | True =>
+          (*Do token A*)
+          currentA <- tokenAbalance;
+          newA = builtin add currentA amount;
+          tokenAbalance := newA
+        | False =>
+          (*Check if Token B else fails*)
+          isTokenB = builtin eq _sender b_addr;
+          match isTokenB with
+            | True =>
+              (*Do Token B*)
+              currentB <- tokenBbalance;
+              newB = builtin add currentB amount;
+              tokenBbalance := newB
+            | False =>
+              err = CodeWrongToken;
+              ThrowError err
+          end
+      end
+    | False =>
+      err = CodeIsNotSender;
+      ThrowError err
+  end
+end
+
+transition RecipientAcceptTransferFrom(
+  initiator : ByStr20,
+  sender : ByStr20,
+  recipient : ByStr20,
+  amount : Uint128
+)
+  isPaused;
+  a_addr <- tokenA_addr;
+  min_token <- minimumStake;
+  total_stakers <- totalStakers;
+  total_staked <- totalStaked;
+  isCorrectToken = builtin eq _sender a_addr;
+  match isCorrectToken with
+    | True =>
+      isMin = builtin lt amount min_token;
+      match isMin with
+        | True =>
+          err = CodeLessThanMinimumStake;
+          ThrowError err
+        | False =>
+          stakedAmt <- stakers[sender];
+          match stakedAmt with
+            | Some stakedAmt =>
+              newStaked = builtin add stakedAmt amount;
+              stakers[sender] := newStaked;
+              newTotalStaked = builtin add total_staked amount;
+              totalStaked := newTotalStaked;
+              (*Checks if user has removed Withdrawal going to remove it since they added stake*)
+              removeStaked <- removeStaker[sender];
+              match removeStaked with
+                | Some removeStaked =>
+                  delete removeStaker[sender];
+                  delete removeBlock[sender]
+                | None =>
+                  (*Do Nth*)
+              end
+            | None =>
+              stakers[sender] := amount;
+              cycleCount[sender] := intZero;
+              newTotalStaked = builtin add total_staked amount;
+              totalStaked := newTotalStaked;
+              addStakers = builtin add total_stakers uintOne;
+              totalStakers := addStakers
+          end
+      end
+    | False =>
+      err = CodeWrongToken;
+      ThrowError err
+  end
+end
+
+transition TransferSuccessCallBack(
+  sender : ByStr20,
+  recipient : ByStr20,
+  amount : Uint128
+)
+end
+
+
+transition TransferFromSuccessCallBack (
+  initiator : ByStr20,
+  sender : ByStr20,
+  recipient : ByStr20,
+  amount : Uint128
+)
+end
